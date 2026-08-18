@@ -193,16 +193,34 @@ jobs:
         run: |
           # Guards against a partially-completed rollout that `rollout status`
           # reported as done because old pods were still counted as available.
+          #
+          # The selector and filters matter more than they look:
+          #   * both name AND instance - `instance` alone also matches the
+          #     retained helm-test pod, whose curl image is not the app
+          #   * status.phase=Running   - excludes pods not yet started
+          #   * no deletionTimestamp   - excludes the previous generation still
+          #     draining, which is expected and healthy during a rolling update
+          # Without those, this check fails on a perfectly good deploy.
           EXPECTED="${{ vars.ACR_LOGIN_SERVER }}/ordersapi/orders-api:${{ inputs.image_tag }}"
           ACTUAL=$(kubectl -n "${NAMESPACE}" get pods \
-            -l "app.kubernetes.io/instance=${RELEASE}" \
-            -o jsonpath='{.items[*].spec.containers[0].image}' | tr ' ' '\n' | sort -u)
-          echo "Expected: ${EXPECTED}"
-          echo "Running:  ${ACTUAL}"
-          if [ "$(echo "${ACTUAL}" | wc -l)" -ne 1 ] || [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            -l "app.kubernetes.io/name=orders-api,app.kubernetes.io/instance=${RELEASE}" \
+            --field-selector=status.phase=Running \
+            -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{(index .spec.containers 0).image}}{{"\n"}}{{end}}{{end}}' \
+            | sort -u)
+
+          echo "Expected image: ${EXPECTED}"
+          echo "Images actually running:"
+          echo "${ACTUAL}" | sed 's/^/  /'
+
+          if [ -z "${ACTUAL}" ]; then
+            echo "::error::No running application pods found."
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "${ACTUAL}" | wc -l)" -ne 1 ] || [ "${ACTUAL}" != "${EXPECTED}" ]; then
             echo "::error::Pods are not all running the deployed tag."
             exit 1
           fi
+          echo "All running pods are on ${{ inputs.image_tag }}."
 
       - name: Helm smoke test
         run: |

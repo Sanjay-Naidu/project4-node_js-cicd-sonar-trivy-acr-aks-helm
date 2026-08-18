@@ -8,7 +8,21 @@ kind: Pod
 metadata:
   name: "{{ include "orders-api.fullname" . }}-test"
   labels:
-    {{- include "orders-api.labels" . | nindent 4 }}
+    # Deliberately NOT orders-api.labels. That helper includes the Service's
+    # selector labels, which would have two consequences:
+    #
+    #   1. This curl pod would be selected by the Service and could be handed
+    #      real traffic (it survives only because the Service targets a named
+    #      port this pod does not expose - too fragile to rely on).
+    #   2. Any `-l app.kubernetes.io/instance=...` query - including the CD
+    #      job's "are all pods on the new image?" assertion - would count this
+    #      pod's curl image as an application pod and fail.
+    #
+    # A distinct name label keeps it identifiable without impersonating the app.
+    app.kubernetes.io/name: {{ include "orders-api.name" . }}-test
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: test
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
   annotations:
     helm.sh/hook: test
     # Kept on failure so the logs are inspectable; the CD workflow deletes it
