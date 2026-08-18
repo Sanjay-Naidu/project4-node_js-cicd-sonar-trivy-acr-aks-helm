@@ -1,0 +1,10 @@
+# Copy to backend.hcl and fill in with the storage account you created manually.
+# backend.hcl is gitignored - it names your state location, which is not
+# something to publish in a public repo.
+#
+#   terraform init -backend-config=backend.hcl
+
+resource_group_name  = "rg-devsecops-tfstate"
+storage_account_name = "stdevsecopstfstate001"
+container_name       = "tfstate"
+key                  = "orders-api/dev.terraform.tfstate"

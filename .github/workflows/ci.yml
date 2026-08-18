@@ -1,0 +1,515 @@
+name: CI
+
+# Quality gates, then build. Nothing reaches the registry until every gate has
+# passed, and nothing reaches the cluster until the image has been scanned.
+#
+#   build  -> mvn verify (node + npm ci + eslint + jest + coverage)
+#   sonar  -> quality gate, build fails if the gate fails
+#   audit  -> npm audit
+#   scan   -> Trivy filesystem + IaC misconfiguration -> GitHub Security tab
+#   image  -> docker build -> Trivy image gate -> SBOM -> sign -> push to ACR
+#   deploy -> calls cd.yml (main branch only)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "LICENSE"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; individual jobs opt into more.
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded PR runs, but never cancel a main-branch run midway
+  # through pushing an image.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  APP_DIR: app
+  IMAGE_NAME: ordersapi/orders-api
+  JAVA_VERSION: "21"
+  REGISTRY: ${{ vars.ACR_LOGIN_SERVER }}
+
+jobs:
+  # ==========================================================================
+  # Build, lint and test via Maven. `mvn verify` is the real build command:
+  # frontend-maven-plugin provisions Node and drives the npm lifecycle.
+  # ==========================================================================
+  build:
+    name: Build & test (Maven)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Sonar needs full history to attribute issues to "new code".
+          fetch-depth: 0
+
+      - name: Derive build metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          # The image tag IS the commit: immutable, and traceable in one step
+          # from a running pod back to source.
+          echo "image_tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Verify lockfile is committed
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "::error::app/package-lock.json is missing. 'npm ci' requires it."
+            echo "Run the 'Bootstrap lockfile' workflow once (Actions -> Bootstrap lockfile -> Run workflow),"
+            echo "or generate it locally with 'npm install' in app/ and commit the result."
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Cache the Maven-provisioned Node toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.APP_DIR }}/target/node
+          key: node-toolchain-${{ runner.os }}-${{ hashFiles('app/pom.xml') }}
+
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      # Runs: install node/npm -> npm ci -> eslint -> jest with coverage.
+      - name: mvn verify
+        working-directory: ${{ env.APP_DIR }}
+        run: mvn --batch-mode --no-transfer-progress verify
+
+      - name: Upload coverage for the Sonar job
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: ${{ env.APP_DIR }}/coverage/
+          retention-days: 5
+
+      - name: Publish test summary
+        if: always()
+        run: |
+          {
+            echo "### Build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ steps.meta.outputs.short_sha }}\` |"
+            echo "| Image tag | \`${{ steps.meta.outputs.image_tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f "${APP_DIR}/coverage/coverage-summary.json" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Coverage" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            node -e '
+              const s = require("./" + process.env.APP_DIR + "/coverage/coverage-summary.json").total;
+              const rows = ["| Metric | % | Covered/Total |", "|---|---|---|"];
+              for (const k of ["statements","branches","functions","lines"]) {
+                rows.push(`| ${k} | ${s[k].pct}% | ${s[k].covered}/${s[k].total} |`);
+              }
+              console.log(rows.join("\n"));
+            ' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ==========================================================================
+  # SonarQube / SonarCloud. Separated from `build` so the quality gate shows up
+  # as its own red/green check rather than being buried in build output.
+  # ==========================================================================
+  sonar:
+    name: SonarQube quality gate
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    # Fork PRs cannot read secrets, so the gate would fail for reasons the
+    # contributor cannot fix.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Restore coverage from the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: ${{ env.APP_DIR }}/coverage/
+
+      - name: Cache Sonar analysis data
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: sonar-${{ runner.os }}
+
+      - name: Analyse and wait for the quality gate
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+        run: |
+          if [ -z "${SONAR_TOKEN}" ]; then
+            echo "::warning::SONAR_TOKEN is not configured - skipping analysis."
+            echo "Add it under Settings -> Secrets and variables -> Actions."
+            exit 0
+          fi
+
+          # -Pskip-npm: reuse the coverage report from the build job instead of
+          # reinstalling Node and re-running the whole suite.
+          # -Dsonar.qualitygate.wait: block until Sonar returns a verdict, so a
+          # failing gate actually fails the pipeline rather than being advisory.
+          mvn --batch-mode --no-transfer-progress -Pskip-npm sonar:sonar \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY || 'orders-api' }}" \
+            -Dsonar.organization="${{ vars.SONAR_ORGANIZATION }}" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=300
+
+  # ==========================================================================
+  # Dependency audit - its own gate so a vulnerable package is unmistakable.
+  # ==========================================================================
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm audit
+        working-directory: ${{ env.APP_DIR }}
+        run: npm run audit:ci
+
+  # ==========================================================================
+  # Trivy: source tree and infrastructure-as-code.
+  #
+  # Non-blocking on purpose (see the image gate below, which IS blocking):
+  # these scans cover Terraform/Helm best-practice rules where a finding is
+  # often a deliberate, documented trade-off. Results go to the Security tab
+  # for triage rather than blocking every push on a style rule.
+  # ==========================================================================
+  scan:
+    name: Trivy (source + IaC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy - dependencies and secrets in the source tree
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Trivy - IaC misconfiguration (Terraform + Helm + Dockerfile)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-config.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload filesystem findings
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Upload IaC findings
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+      # Blocking check on secrets only. A committed credential is never an
+      # acceptable trade-off, so this one fails the build immediately.
+      - name: Fail on committed secrets
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+
+  # ==========================================================================
+  # Chart correctness. Catches a broken template before it ever reaches a
+  # cluster, and is the only place `helm template` output is schema-validated.
+  # ==========================================================================
+  helm:
+    name: Helm lint & render
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: helm lint (both overlays, strict)
+        run: |
+          for env in dev prod; do
+            echo "::group::lint ${env}"
+            helm lint deploy/helm/orders-api \
+              --values deploy/helm/orders-api/values-${env}.yaml \
+              --set image.tag=ci-test \
+              --strict
+            echo "::endgroup::"
+          done
+
+      - name: Render manifests
+        run: |
+          helm template orders-api deploy/helm/orders-api \
+            --values deploy/helm/orders-api/values-dev.yaml \
+            --set image.tag=ci-test \
+            --namespace orders-api > /tmp/rendered.yaml
+          cat /tmp/rendered.yaml
+
+      # Validates the rendered YAML against real Kubernetes API schemas without
+      # needing a cluster.
+      - name: Validate against Kubernetes schemas
+        run: |
+          curl -sSLo /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          /tmp/kubeconform -strict -summary -kubernetes-version 1.30.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /tmp/rendered.yaml
+
+      - name: Assert the production-critical settings survived templating
+        run: |
+          # A chart that renders is not the same as a chart that is correct.
+          # These are the settings whose loss would be silent and expensive.
+          set -e
+          grep -q "maxUnavailable: 0"        /tmp/rendered.yaml || { echo "rolling update lost maxUnavailable: 0"; exit 1; }
+          grep -q "startupProbe"             /tmp/rendered.yaml || { echo "startup probe missing"; exit 1; }
+          grep -q "readinessProbe"           /tmp/rendered.yaml || { echo "readiness probe missing"; exit 1; }
+          grep -q "livenessProbe"            /tmp/rendered.yaml || { echo "liveness probe missing"; exit 1; }
+          grep -q "runAsNonRoot: true"       /tmp/rendered.yaml || { echo "pods would run as root"; exit 1; }
+          grep -q "readOnlyRootFilesystem: true" /tmp/rendered.yaml || { echo "root filesystem is writable"; exit 1; }
+          grep -q "kind: PodDisruptionBudget" /tmp/rendered.yaml || { echo "PDB missing"; exit 1; }
+          echo "All rollout and hardening assertions passed."
+
+  # ==========================================================================
+  # Container image: build -> scan (BLOCKING) -> SBOM -> sign -> push.
+  #
+  # The image is built and scanned on pull requests too, but only pushed from
+  # main. That means a vulnerable base image is caught in review, not after
+  # merge.
+  # ==========================================================================
+  image:
+    name: Build, scan & push image
+    runs-on: ubuntu-latest
+    needs: [build, audit, helm]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write        # OIDC federation to Azure and to Sigstore
+      security-events: write
+
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve the image reference
+        id: img
+        run: |
+          # On a PR there is no registry to push to, so build under a local name.
+          if [ -n "${{ env.REGISTRY }}" ]; then
+            echo "ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ACR_LOGIN_SERVER variable is not set - building locally only."
+            echo "ref=localhost/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # load: true keeps the image in the local daemon so Trivy can scan the
+      # exact artefact that will be pushed - not a rebuild of it.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          load: true
+          push: false
+          tags: ${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}
+          build-args: |
+            APP_VERSION=${{ env.IMAGE_TAG }}
+            GIT_SHA=${{ env.IMAGE_TAG }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      # THE security gate. Unlike the advisory IaC scan, this one blocks: a
+      # HIGH or CRITICAL vulnerability in the image never reaches the registry,
+      # so it can never reach the cluster.
+      - name: Trivy image scan (blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true      # no point failing on a CVE with no patch
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+
+      - name: Trivy image scan (SARIF for the Security tab)
+        uses: aquasecurity/trivy-action@0.28.0
+        if: always()
+        with:
+          scan-type: image
+          image-ref: ${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload image findings
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Generate SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Publish SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ env.IMAGE_TAG }}
+          path: sbom.cdx.json
+          retention-days: 30
+
+      # ---- Everything below only runs on main, and only once a registry
+      #      exists. Gating on ACR_LOGIN_SERVER means the full build-and-scan
+      #      path is exercised before any infrastructure has been provisioned,
+      #      rather than failing the run on a registry that is not there yet. ----
+
+      - name: Azure login (OIDC - no stored credentials)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push to ACR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != ''
+        run: |
+          # Exchanges the Entra ID token for a registry refresh token. No
+          # registry username or password exists anywhere.
+          az acr login --name "${{ vars.ACR_NAME }}"
+          docker push "${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}"
+
+          # Also publish the semver tag when the commit is release-tagged.
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            docker tag "${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}" "${{ steps.img.outputs.ref }}:${VERSION}"
+            docker push "${{ steps.img.outputs.ref }}:${VERSION}"
+          fi
+
+      # Keyless signing: the signature is bound to this repo + workflow identity
+      # via the same OIDC token, and recorded in the public Rekor transparency
+      # log. Nothing to store, nothing to rotate.
+      - name: Install cosign
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != '' && vars.ENABLE_IMAGE_SIGNING != 'false'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != '' && vars.ENABLE_IMAGE_SIGNING != 'false'
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' \
+            "${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}")
+          echo "Signing ${DIGEST}"
+          # Sign by digest, never by tag - a tag can be repointed after signing.
+          cosign sign --yes "${DIGEST}"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Image"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Reference | \`${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}\` |"
+            echo "| Vulnerability gate | CRITICAL/HIGH, fixed only |"
+            echo "| Pushed | ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }} |"
+            echo "| SBOM | CycloneDX, attached to this run |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # Continuous deployment. Delegated to a reusable workflow so the same
+  # definition serves both automatic (post-merge) and manual promotion.
+  # ==========================================================================
+  deploy:
+    name: Deploy
+    needs: [build, image, sonar, scan]
+    # Skipped until the cluster and registry exist, so CI is green and useful
+    # from the very first push rather than red until infrastructure is applied.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != '' && vars.AKS_CLUSTER_NAME != ''
+    uses: ./.github/workflows/cd.yml
+    with:
+      image_tag: ${{ needs.build.outputs.image_tag }}
+      environment: dev
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write

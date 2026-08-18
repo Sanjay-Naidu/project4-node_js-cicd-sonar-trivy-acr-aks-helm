@@ -1,0 +1,43 @@
+orders-api {{ .Values.image.tag | default .Chart.AppVersion }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Rollout status:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "orders-api.fullname" . }} --timeout=5m
+
+{{- if .Values.ingress.enabled }}
+
+Ingress ({{ .Values.ingress.className }}):
+
+  INGRESS_IP=$(kubectl -n {{ .Values.networkPolicy.ingressControllerNamespace }} get svc \
+    -l app.kubernetes.io/component=controller \
+    -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+  curl "http://${INGRESS_IP}/healthz"
+{{- end }}
+
+{{- if eq .Values.service.type "LoadBalancer" }}
+
+LoadBalancer Service (its own Azure public IP; takes 1-3 minutes to provision):
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "orders-api.fullname" . }} -w
+
+  SVC_IP=$(kubectl -n {{ .Release.Namespace }} get svc {{ include "orders-api.fullname" . }} \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  curl "http://${SVC_IP}/api/v1/orders"
+{{- end }}
+
+Deployed configuration:
+  replicas          {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }} (static){{ end }}
+  strategy          RollingUpdate maxSurge={{ .Values.rollingUpdate.maxSurge }} maxUnavailable={{ .Values.rollingUpdate.maxUnavailable }}
+  probes            startup={{ .Values.probes.startup.enabled }} readiness={{ .Values.probes.readiness.enabled }} liveness={{ .Values.probes.liveness.enabled }}
+  service           {{ .Values.service.type }} :{{ .Values.service.port }}
+  network policy    {{ .Values.networkPolicy.enabled }}
+  PDB               {{ if .Values.podDisruptionBudget.enabled }}maxUnavailable={{ .Values.podDisruptionBudget.maxUnavailable }}{{ else }}disabled{{ end }}
+
+{{- if not .Values.autoscaling.enabled }}
+
+NOTE: autoscaling is disabled, so replicaCount is authoritative.
+{{- end }}
+
+Roll back:
+
+  helm -n {{ .Release.Namespace }} rollback {{ .Release.Name }}

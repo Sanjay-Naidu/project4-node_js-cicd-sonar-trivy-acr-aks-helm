@@ -1,0 +1,61 @@
+# ---- Node ----
+node_modules/
+coverage/
+*.log
+npm-debug.log*
+.npm/
+
+# ---- Maven ----
+target/
+.mvn/wrapper/maven-wrapper.jar
+
+# ---- Terraform ----
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+# Trailing glob, not a bare name: saved plans get suffixed per environment
+# (tfplan.dev, tfplan.prod) and a plan file contains the full resolved
+# configuration, including any sensitive variable values.
+tfplan*
+plan.txt
+plan-truncated.txt
+
+# Names the state location - not for a public repo.
+backend.hcl
+
+# Real variable files may carry subscription ids and object ids.
+# environments/*.tfvars are committed deliberately and contain no secrets.
+*.auto.tfvars
+terraform.tfvars
+
+# ---- Helm ----
+*.tgz
+deploy/helm/**/charts/
+
+# ---- Secrets and credentials ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+kubeconfig
+*.kubeconfig
+azureauth.json
+
+# ---- Build output ----
+sbom.cdx.json
+*.sarif
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini

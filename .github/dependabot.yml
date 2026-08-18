@@ -1,0 +1,80 @@
+version: 2
+
+# Keeping dependencies current is the cheapest way to keep the Trivy image gate
+# green: without it, the blocking scan eventually fails on a CVE that has had a
+# patch available for months.
+#
+# Policy: minor and patch updates are batched and welcome; MAJOR updates are
+# not raised automatically. A major bump is an API change - zod 3 to 4, azurerm
+# 4 to 5, ESLint 9 to 10 flat-config changes - and an auto-opened PR for one is
+# guaranteed-red noise that trains you to ignore Dependabot entirely.
+#
+# The trade-off, stated explicitly: ignoring a major also suppresses security
+# updates for that major. That is acceptable here because the pipeline has two
+# independent blocking vulnerability gates (npm audit at high, and Trivy on the
+# built image), so a genuinely exploitable dependency fails the build whether
+# or not Dependabot filed a PR. Majors are reviewed and taken deliberately.
+
+updates:
+  - package-ecosystem: npm
+    directory: /app
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, javascript]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # One PR for all patch/minor bumps: individually they are noise, and
+      # batching means one CI run instead of fifteen.
+      production-minor:
+        applies-to: version-updates
+        dependency-type: production
+        update-types: [minor, patch]
+      development:
+        applies-to: version-updates
+        dependency-type: development
+        update-types: [minor, patch]
+
+  - package-ecosystem: maven
+    directory: /app
+    schedule:
+      interval: monthly
+    labels: [dependencies, build]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: docker
+    directory: /app
+    schedule:
+      interval: weekly
+    labels: [dependencies, docker]
+    ignore:
+      # The Node major is a deliberate platform choice pinned in package.json
+      # engines, the Dockerfile ARG and the Maven toolchain. Bumping it is a
+      # coordinated change across all three, never a one-line PR.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci]
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: terraform
+    directory: /infra/terraform
+    schedule:
+      interval: monthly
+    labels: [dependencies, terraform]
+    ignore:
+      # A provider major (azurerm 4 -> 5) renames and removes resource
+      # attributes. It is a migration, not an update.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

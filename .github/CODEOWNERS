@@ -1,0 +1,9 @@
+# Default owner for everything.
+* @Sanjay-Naidu
+
+# Paths where a mistake is expensive and a second reader is worth the delay:
+# pipeline definitions can exfiltrate secrets, and infrastructure changes cost
+# money and can destroy state.
+/.github/workflows/  @Sanjay-Naidu
+/infra/              @Sanjay-Naidu
+/deploy/             @Sanjay-Naidu

@@ -1,0 +1,15 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "orders-api.fullname" . }}
+  labels:
+    {{- include "orders-api.labels" . | nindent 4 }}
+spec:
+  # Governs VOLUNTARY disruption only - node drains, cluster upgrades, the
+  # autoscaler consolidating nodes. It does not protect against a node crashing.
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "orders-api.selectorLabels" . | nindent 6 }}
+{{- end }}

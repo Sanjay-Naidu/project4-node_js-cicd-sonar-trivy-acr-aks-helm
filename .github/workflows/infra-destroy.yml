@@ -1,0 +1,149 @@
+name: Infrastructure destroy
+
+# Tears the whole stack down.
+#
+# This exists as a first-class, one-click workflow for a specific reason: on a
+# fixed trial credit the most expensive mistake is forgetting to delete an idle
+# cluster. Making teardown as easy as deployment is a cost control.
+#
+# Guard rails: a typed confirmation phrase AND a protected environment, so it
+# cannot be triggered by a stray click or an accidental API call.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to destroy
+        required: true
+        default: dev
+        type: choice
+        options: [dev, prod]
+      confirm:
+        description: 'Type DESTROY (all caps) to confirm'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.10.3"
+  TF_DIR: infra/terraform
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+
+jobs:
+  confirm:
+    name: Validate confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the confirmation phrase
+        run: |
+          if [ "${{ inputs.confirm }}" != "DESTROY" ]; then
+            echo "::error::Confirmation failed. Type DESTROY exactly to proceed."
+            exit 1
+          fi
+          echo "Confirmed - destroying the ${{ inputs.environment }} stack."
+
+  destroy:
+    name: Terraform destroy (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: confirm
+    timeout-minutes: 60
+    # Add required reviewers to this environment in repo settings for a second
+    # pair of eyes before anything is deleted.
+    environment: infra-destroy
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: v0.1.4
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=orders-api/${{ inputs.environment }}.terraform.tfstate"
+
+      # Helm-created Azure resources (the ingress controller's public IP and LB
+      # rules) are not in Terraform state. Removing the Services first lets AKS
+      # release them cleanly - otherwise the VNet delete blocks on orphaned
+      # load balancer references and the destroy fails halfway through.
+      - name: Release Kubernetes-provisioned load balancers first
+        continue-on-error: true
+        run: |
+          if ! az aks show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AKS_CLUSTER_NAME }}" >/dev/null 2>&1; then
+            echo "Cluster already gone - nothing to clean up."
+            exit 0
+          fi
+
+          az aks get-credentials \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "Deleting all LoadBalancer Services..."
+          kubectl delete svc --all-namespaces \
+            --field-selector spec.type=LoadBalancer --ignore-not-found --timeout=5m || true
+
+          echo "Waiting for Azure to release the public IPs..."
+          sleep 60
+
+      - name: terraform destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform destroy -no-color -auto-approve -lock-timeout=5m \
+            -var-file="environments/${{ inputs.environment }}.tfvars"
+
+      - name: Report what remains
+        if: always()
+        run: |
+          {
+            echo "### Teardown complete"
+            echo ""
+            echo "Destroyed: AKS, ACR, VNet, NSG, Log Analytics."
+            echo ""
+            echo "**Still present** (created manually, outside Terraform):"
+            echo "- the resource group \`${{ vars.AZURE_RESOURCE_GROUP }}\`"
+            echo "- the Terraform state storage account"
+            echo "- the Entra ID app registration"
+            echo ""
+            echo "Confirm nothing is still billing:"
+            echo '```'
+            echo "az resource list -g ${{ vars.AZURE_RESOURCE_GROUP }} -o table"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

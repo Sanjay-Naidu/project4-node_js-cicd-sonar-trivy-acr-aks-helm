@@ -1,0 +1,33 @@
+# Line endings are a correctness concern here, not a style preference.
+#
+# This repo is authored on Windows and executed on Linux (GitHub-hosted
+# runners, Alpine containers, AKS nodes). A shell script committed with CRLF
+# arrives on Linux with a trailing \r on the shebang, and the kernel reports
+# "bad interpreter: /usr/bin/env bash^M". A Makefile with CRLF fails the same
+# way. Normalising to LF in the repository prevents that regardless of the
+# contributor's core.autocrlf setting.
+
+* text=auto eol=lf
+
+# Must be LF - these are executed on Linux.
+*.sh            text eol=lf
+Makefile        text eol=lf
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.tpl           text eol=lf
+*.tf            text eol=lf
+*.tfvars        text eol=lf
+*.hcl           text eol=lf
+
+# Windows PowerShell is happiest with CRLF, and these only ever run on Windows.
+*.ps1           text eol=crlf
+
+# Generated - collapse in diffs and exclude from language statistics.
+package-lock.json  linguist-generated=true -diff
+
+# Binary.
+*.png binary
+*.jpg binary
+*.ico binary
+*.tgz binary
