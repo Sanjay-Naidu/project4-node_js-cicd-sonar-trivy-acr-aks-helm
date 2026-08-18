@@ -20,15 +20,30 @@ az account set --subscription "<your subscription>"
 az account show --output table
 ```
 
-### Check your quota first
+### Check quota AND SKU permission first
 
-Free trial subscriptions are capped at a small number of vCPUs per region, and the default here (2 × `Standard_B2s`) needs **4**. This is the single most common reason a first `terraform apply` fails:
+These are two different checks, and the most common first-`apply` failure is passing one while failing the other.
+
+**1. Regional vCPU quota.** The default here (2 × `Standard_D2as_v7`) needs **4**:
 
 ```bash
-az vm list-usage --location eastus --output table | grep -i "Standard B"
+az vm list-usage --location eastus --output table | grep "Total Regional vCPUs"
 ```
 
-If `Limit` is below 4, either request a quota increase or pick a region that has capacity.
+**2. Whether the SKU is permitted at all.** Many trial and MSDN subscriptions block whole families — burstable B-series in particular:
+
+```bash
+az vm list-skus --location eastus --size Standard_D2as_v7 --query "[].restrictions" -o json
+# [] means usable. Anything else lists the restriction.
+```
+
+The trap: `az vm list-usage` will happily report `Standard BS Family vCPUs: limit 4`, implying B-series is available, while AKS rejects the create with:
+
+```
+The VM size of Standard_B2s is not allowed in your subscription in location 'eastus'.
+```
+
+Quota says "you may use this many"; SKU permission says "you may use this type". You need both. If `Standard_D2as_v7` is restricted on your subscription, the error message from AKS conveniently lists every size that *is* allowed — pick the cheapest one with at least 2 vCPU and 4 GiB.
 
 ---
 

@@ -1,4 +1,4 @@
-# Dev overlay - sized for a 2 x Standard_B2s trial cluster (4 vCPU total).
+# Dev overlay - sized for a 2 x Standard_D2as_v7 trial cluster (4 vCPU total).
 #
 # Still 3 replicas, still zero-downtime rolling updates: the point of the demo
 # is that the *rollout mechanics* are real, only the capacity is small.

@@ -105,7 +105,7 @@ Then the honest limitation: the ingress rule is permissive on the app port, beca
 **"What would you change for real production?"**
 Have a genuine list:
 - Separate system and user node pools; `only_critical_addons_enabled` on the system pool
-- Non-burstable SKUs across three availability zones
+- Three availability zones (the trial subscription has no zonal capacity, so `availability_zones = []` here)
 - Private cluster with API server IP restrictions (needs self-hosted runners)
 - ACR Premium with a private endpoint and image retention
 - Progressive delivery — Argo Rollouts or Flagger for canary with automatic metric-based abort

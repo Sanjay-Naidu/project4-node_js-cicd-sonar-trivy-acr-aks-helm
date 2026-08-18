@@ -1,16 +1,27 @@
 # Dev / trial-subscription profile.
 #
-# HARD CONSTRAINT: this subscription has a Total Regional vCPU quota of 4 in
-# eastus (verified with `az vm list-usage --location eastus`). Standard_B2s is
-# 2 vCPU and is already the smallest SKU AKS accepts for a system pool, so
-# 2 nodes consumes the entire quota. Every setting below follows from that.
+# TWO HARD CONSTRAINTS on this subscription, and every setting below follows
+# from them:
+#
+# 1. Total Regional vCPU quota is 4 in eastus. At 2 vCPU per node that is
+#    exactly two nodes, with nothing spare.
+#
+# 2. Burstable (B-series) SKUs are NOT PERMITTED on this subscription. This is
+#    a subscription policy, not a quota - `az vm list-usage` cheerfully reports
+#    "Standard BS Family vCPUs: limit 4" while AKS rejects the create with
+#    "The VM size of Standard_B2s is not allowed in your subscription".
+#    Quota and SKU permission are separate things; check both.
+#
+# Standard_D2as_v7 is the cheapest permitted SKU meeting the AKS system-pool
+# minimum of 2 vCPU / 4 GiB (it has 8 GiB, giving real headroom for the
+# ingress controller and Container Insights alongside the app).
 
 resource_group_name = "rg-ordersapi-dev"
 project             = "ordersapi"
 environment         = "dev"
 location            = "eastus"
 
-node_vm_size = "Standard_B2s"
+node_vm_size = "Standard_D2as_v7"
 
 # 2 x 2 vCPU = 4 = the whole regional quota. min == max because the cluster
 # autoscaler has nowhere to grow: a third node would need 6 vCPU and every
@@ -26,8 +37,8 @@ node_max_count = 2
 automatic_upgrade_channel = "none"
 node_os_upgrade_channel   = "None"
 
-# Burstable SKUs frequently have no zonal capacity on trial subscriptions, and
-# an unsatisfiable zonal request fails the entire apply.
+# Trial subscriptions frequently have no zonal capacity, and an unsatisfiable
+# zonal request fails the entire apply.
 availability_zones = []
 
 acr_sku = "Basic"

@@ -1,8 +1,8 @@
 # Cost
 
-Sized for a 30-day Azure free trial (~$159 / ₹13,000 credit).
+Sized to run on an Azure free-trial credit for a demo period, then be destroyed.
 
-> Prices are `eastus` pay-as-you-go list, accurate to roughly ±15% and subject to change. Use them to compare options, not to forecast a bill. Check the live figure with the [Azure pricing calculator](https://azure.microsoft.com/pricing/calculator/) or `az costmanagement`.
+> Prices are `eastus` pay-as-you-go list, accurate to roughly ±15% and subject to change. Use them to compare options, not to forecast a bill. Node prices below were pulled from the [Azure Retail Prices API](https://prices.azure.com/api/retail/prices) rather than guessed.
 
 ---
 
@@ -11,7 +11,7 @@ Sized for a 30-day Azure free trial (~$159 / ₹13,000 credit).
 | Resource | Configuration | ~USD/month | ~USD/day |
 |---|---|---:|---:|
 | AKS control plane | Free tier | $0.00 | $0.00 |
-| Nodes | 2 × `Standard_B2s` (2 vCPU / 4 GiB) | $60.00 | $2.00 |
+| Nodes | 2 × `Standard_D2as_v7` (2 vCPU / 8 GiB) | $132.56 | $4.42 |
 | OS disks | 2 × 64 GB Standard SSD (E6) | $9.60 | $0.32 |
 | Standard Load Balancer | 1 rule set | $18.25 | $0.61 |
 | Public IPs | 2 × static standard (ingress + Service) | $7.30 | $0.24 |
@@ -19,9 +19,27 @@ Sized for a 30-day Azure free trial (~$159 / ₹13,000 credit).
 | Log Analytics | 0.2 GB/day cap @ $2.76/GB | $16.56 | $0.55 |
 | Storage (state) | LRS, < 1 MB | $0.02 | $0.00 |
 | Bandwidth | light demo traffic | ~$1.00 | $0.03 |
-| **Total** | | **~$117** | **~$3.92** |
+| **Total** | | **~$190** | **~$6.34** |
 
-**≈ 30 days on a $159 credit**, with room to spare.
+### Why the nodes cost more than they "should"
+
+The obvious choice is `Standard_B2s` at roughly $30/month — half the price. It does not work here, and the reason is worth knowing:
+
+```
+The VM size of Standard_B2s is not allowed in your subscription in location 'eastus'.
+```
+
+Burstable B-series is **not permitted** on this subscription. That is a *SKU permission* restriction, entirely separate from quota — and the two disagree in a way that is genuinely misleading:
+
+```bash
+# Reports a limit of 4. Implies B2s is usable. It is not.
+az vm list-usage --location eastus --output table | grep "Standard BS"
+
+# This is the check that actually matters:
+az vm list-skus --location eastus --size Standard_D2as_v7 --query "[].restrictions"
+```
+
+Of the families this subscription does permit (D/E/F v7 and the confidential-compute v3/v5 series), `Standard_D2as_v7` is the cheapest that meets the AKS system-pool minimum of 2 vCPU / 4 GiB. At $66.28/month per node it roughly doubles the compute line — which is exactly why the stop and destroy levers below stop being optional.
 
 ### Realistic usage is much lower
 
@@ -29,10 +47,10 @@ The table assumes the cluster runs 24×7 for a month. For a portfolio project yo
 
 | Pattern | Cost |
 |---|---|
-| 3 days continuous | ~$12 |
-| 7 days continuous | ~$27 |
-| 30 days, stopped nightly (`az aks stop`) | ~$60 |
-| 30 days continuous | ~$117 |
+| 3 days continuous | ~$19 |
+| 7 days continuous | ~$44 |
+| 30 days, stopped nightly (`az aks stop`) | ~$95 |
+| 30 days continuous | ~$190 |
 
 ---
 
@@ -60,9 +78,9 @@ Takes the bill to effectively zero. Redeploying from scratch takes about 15 minu
 | Decision | Alternative | Monthly saving |
 |---|---|---|
 | AKS **Free** tier | Standard (99.95% API SLA) | $73 |
-| `Standard_B2s` | `Standard_D2s_v5` | $30 |
+| `Standard_D2as_v7` | `Standard_D2s_v7` (the permitted default) | $60 |
 | ACR **Basic** | Premium (private endpoints, geo-replication) | $45 |
-| 2 nodes | 3 nodes | $30 |
+| 2 nodes | 3 nodes | $66 |
 | Log Analytics capped at 0.2 GB/day | uncapped | unbounded |
 | No Application Gateway / WAF | AGIC | $250+ |
 | No Azure Firewall | egress filtering | $912 |

@@ -263,7 +263,7 @@ Not an afterthought — it changed real decisions:
 | Decision | Alternative | Saving |
 |---|---|---|
 | AKS Free tier | Standard (SLA) | ~$73/mo |
-| `Standard_B2s` | `Standard_D2s_v5` | ~$30/mo |
+| `Standard_D2as_v7` | `Standard_D2s_v7` | ~$60/mo |
 | ACR Basic | Premium | ~$45/mo |
 | Log Analytics 0.2 GB/day cap | uncapped | unbounded |
 | One-click destroy workflow | manual cleanup | the entire remaining credit |

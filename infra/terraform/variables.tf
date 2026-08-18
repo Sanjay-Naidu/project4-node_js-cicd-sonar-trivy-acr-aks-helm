@@ -87,8 +87,8 @@ variable "automatic_upgrade_channel" {
     AKS patch upgrade channel. "patch" is the right production answer, but an
     upgrade surges an extra node (see max_surge) and therefore needs spare
     regional vCPU quota. On a free-trial subscription capped at 4 vCPUs - which
-    2 x Standard_B2s consumes entirely - a surge cannot be satisfied and the
-    upgrade fails, so dev sets this to "none".
+    2 x Standard_D2as_v7 consumes entirely - a surge cannot be satisfied and
+    the upgrade fails, so dev sets this to "none".
   EOT
   # "none" is not a provider enum member; aks.tf translates it to null, which is
   # how the API expresses "no automatic upgrades".
@@ -108,9 +108,16 @@ variable "node_os_upgrade_channel" {
 }
 
 variable "node_vm_size" {
-  description = "Node SKU. Standard_B2s (2 vCPU / 4 GiB) is the cheapest size AKS will accept for a system pool - roughly a third the cost of a D2s_v5."
+  description = <<-EOT
+    Node SKU. Must satisfy the AKS system-pool minimum of 2 vCPU / 4 GiB AND be
+    permitted on the subscription - those are different checks. Many trial and
+    MSDN subscriptions block burstable B-series entirely, which surfaces only at
+    create time as "The VM size ... is not allowed in your subscription".
+    Confirm with:
+      az vm list-skus --location <region> --size <sku> --query "[].restrictions"
+  EOT
   type        = string
-  default     = "Standard_B2s"
+  default     = "Standard_D2as_v7"
 }
 
 variable "node_count" {
@@ -137,17 +144,18 @@ variable "node_max_count" {
 }
 
 variable "node_os_disk_size_gb" {
-  description = "Managed OS disk per node. Ephemeral OS disks are not used because the B-series cache is too small to hold one."
+  description = "Managed OS disk per node. Ephemeral OS disks would be free of charge but need a cache at least as large as the image, which constrains SKU choice - not worth the coupling here."
   type        = number
   default     = 64
 }
 
 variable "availability_zones" {
   description = <<-EOT
-    Zones to spread nodes across. Defaults to [] because burstable (B-series)
-    SKUs frequently have no zonal capacity on trial subscriptions, and a zonal
+    Zones to spread nodes across. Defaults to [] because trial subscriptions
+    frequently have no zonal capacity for the SKUs they permit, and a zonal
     request that cannot be satisfied fails the whole apply. Set to
-    ["1","2","3"] with a D-series SKU for a genuinely production topology.
+    ["1","2","3"] on a subscription with real capacity for a genuinely
+    production topology.
   EOT
   type        = list(string)
   default     = []
