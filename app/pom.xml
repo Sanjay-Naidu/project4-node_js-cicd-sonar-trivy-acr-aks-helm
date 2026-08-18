@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Maven build wrapper for the Node.js service.
+
+  Maven does not build JavaScript on its own. `frontend-maven-plugin`
+  provisions a project-local Node/npm toolchain (nothing is required on the
+  build agent beyond a JDK) and binds the npm lifecycle onto the standard
+  Maven phases, so `mvn verify` is a genuine build:
+
+      initialize        install node + npm, npm ci
+      process-sources   npm run lint
+      test              npm run test:coverage  -> coverage/lcov.info
+      sonar:sonar       upload sources + lcov coverage to SonarQube/SonarCloud
+
+  Dependency auditing runs as its own CI step rather than a Maven phase, so a
+  vulnerable transitive package shows up as a distinct red gate in the Actions
+  UI instead of being buried in `mvn verify` output.
+
+  This is the pattern used by JVM shops that keep one build tool across
+  polyglot repos: the same `mvn` command, the same quality gate, the same
+  reporting, regardless of language.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.sanjaynaidu</groupId>
+  <artifactId>orders-api</artifactId>
+  <version>1.0.0</version>
+  <!-- `pom` packaging: the deliverable is a container image, not a jar. -->
+  <packaging>pom</packaging>
+
+  <name>orders-api</name>
+  <description>Node.js REST API built, scanned and shipped to AKS via GitHub Actions</description>
+  <url>https://github.com/Sanjay-Naidu/project4-node_js-cicd-sonar-trivy-acr-aks-helm</url>
+
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>Sanjay-Naidu</id>
+      <name>Sanjay Naidu</name>
+      <url>https://github.com/Sanjay-Naidu</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <url>https://github.com/Sanjay-Naidu/project4-node_js-cicd-sonar-trivy-acr-aks-helm</url>
+    <connection>scm:git:https://github.com/Sanjay-Naidu/project4-node_js-cicd-sonar-trivy-acr-aks-helm.git</connection>
+  </scm>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <node.version>v22.12.0</node.version>
+    <npm.version>10.9.0</npm.version>
+    <frontend-maven-plugin.version>1.15.1</frontend-maven-plugin.version>
+    <sonar-maven-plugin.version>5.0.0.4389</sonar-maven-plugin.version>
+
+    <!--
+      Sonar wiring. Override projectKey/organization from CI:
+        mvn sonar:sonar -Dsonar.projectKey=... -Dsonar.organization=...
+      SONAR_TOKEN and SONAR_HOST_URL are read from the environment.
+    -->
+    <sonar.projectKey>orders-api</sonar.projectKey>
+    <sonar.projectName>orders-api</sonar.projectName>
+    <sonar.sources>src</sonar.sources>
+    <sonar.tests>tests</sonar.tests>
+    <sonar.sourceEncoding>UTF-8</sonar.sourceEncoding>
+    <sonar.javascript.lcov.reportPaths>coverage/lcov.info</sonar.javascript.lcov.reportPaths>
+    <sonar.coverage.exclusions>tests/**,jest.config.js,eslint.config.js,src/index.js</sonar.coverage.exclusions>
+    <sonar.exclusions>node_modules/**,coverage/**,target/**</sonar.exclusions>
+  </properties>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>com.github.eirslett</groupId>
+        <artifactId>frontend-maven-plugin</artifactId>
+        <version>${frontend-maven-plugin.version}</version>
+
+        <configuration>
+          <!-- Keep the downloaded toolchain inside target/ so `mvn clean`
+               genuinely resets the build and nothing leaks into the repo. -->
+          <installDirectory>${project.build.directory}</installDirectory>
+        </configuration>
+
+        <executions>
+          <execution>
+            <id>install-node-and-npm</id>
+            <goals><goal>install-node-and-npm</goal></goals>
+            <phase>initialize</phase>
+            <configuration>
+              <nodeVersion>${node.version}</nodeVersion>
+              <npmVersion>${npm.version}</npmVersion>
+            </configuration>
+          </execution>
+
+          <execution>
+            <id>npm-ci</id>
+            <goals><goal>npm</goal></goals>
+            <phase>initialize</phase>
+            <configuration>
+              <!-- `ci` not `install`: fails loudly if the lockfile and
+                   package.json have drifted, instead of silently resolving
+                   different versions than were reviewed. -->
+              <arguments>ci --no-audit --no-fund</arguments>
+            </configuration>
+          </execution>
+
+          <execution>
+            <id>npm-lint</id>
+            <goals><goal>npm</goal></goals>
+            <phase>process-sources</phase>
+            <configuration>
+              <arguments>run lint</arguments>
+            </configuration>
+          </execution>
+
+          <execution>
+            <id>npm-test</id>
+            <goals><goal>npm</goal></goals>
+            <phase>test</phase>
+            <configuration>
+              <arguments>run test:coverage</arguments>
+              <environmentVariables>
+                <CI>true</CI>
+              </environmentVariables>
+            </configuration>
+          </execution>
+
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.sonarsource.scanner.maven</groupId>
+        <artifactId>sonar-maven-plugin</artifactId>
+        <version>${sonar-maven-plugin.version}</version>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!--
+      `mvn verify -Pskip-npm` runs the POM without the Node lifecycle. Used by
+      the Sonar-only CI job, which consumes the coverage report produced by an
+      earlier job rather than re-running the whole test suite.
+    -->
+    <profile>
+      <id>skip-npm</id>
+      <properties>
+        <skip.npm>true</skip.npm>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>com.github.eirslett</groupId>
+            <artifactId>frontend-maven-plugin</artifactId>
+            <configuration>
+              <skip>true</skip>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

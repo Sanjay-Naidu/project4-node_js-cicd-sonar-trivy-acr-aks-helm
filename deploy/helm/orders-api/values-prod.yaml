@@ -1,0 +1,77 @@
+# Production overlay.
+#
+# Kept in the repo to make the dev/prod delta reviewable. The differences are
+# capacity and strictness - never the rollout mechanics, which stay identical
+# so a deploy behaves the same way in both environments.
+
+replicaCount: 6
+
+autoscaling:
+  enabled: true
+  minReplicas: 6
+  maxReplicas: 30
+  targetCPUUtilizationPercentage: 60
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+config:
+  LOG_LEVEL: info
+  # Longer drain: at production connection volumes, endpoint propagation
+  # through kube-proxy and NGINX takes measurably longer.
+  SHUTDOWN_DRAIN_MS: "15000"
+  SHUTDOWN_TIMEOUT_MS: "30000"
+  STARTUP_DELAY_MS: "0"
+
+terminationGracePeriodSeconds: 60
+
+# ClusterIP: the ingress controller is the only front door, so a per-Service
+# public IP would be an extra cost and an extra unmonitored attack surface.
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+    nginx.ingress.kubernetes.io/enable-request-id: "true"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+  hosts:
+    - host: orders.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: orders-api-tls
+      hosts:
+        - orders.example.com
+
+# Enough nodes across enough zones that hard anti-affinity is satisfiable, so
+# no two replicas can share a node's failure domain.
+podAntiAffinity:
+  enabled: true
+  type: required
+
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
+  # Ingress-only: with a ClusterIP Service there is no Azure LB source address
+  # to accommodate, so the policy can be genuinely restrictive.
+  allowExternalLoadBalancer: false

@@ -1,0 +1,56 @@
+name: CodeQL
+
+# Static application security testing. Complements the other two scanners
+# rather than duplicating them:
+#
+#   SonarQube -> code quality, maintainability, coverage, some security rules
+#   Trivy     -> known CVEs in dependencies and base images
+#   CodeQL    -> dataflow analysis of our OWN code (injection, SSRF, unsafe
+#                deserialisation) - vulnerabilities that no CVE database lists
+#                because we just wrote them.
+#
+# Free for public repositories.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/codeql.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+  schedule:
+    # Weekly: the rule packs improve over time, so code that was clean last
+    # month can legitimately produce a finding today.
+    - cron: "27 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze JavaScript
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          # security-extended adds lower-severity and experimental queries on
+          # top of the default set.
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"

@@ -1,0 +1,16 @@
+# Trivy suppressions.
+#
+# Every entry must have: the CVE, why it is not exploitable here, and an expiry.
+# An unexplained or undated suppression is indistinguishable from ignoring the
+# scanner, which defeats the point of having a blocking gate.
+#
+# Format:
+#   CVE-YYYY-NNNNN exp:YYYY-MM-DD
+#
+# Example of an acceptable suppression:
+#   # CVE-2024-00000: parser DoS in a transitive dev dependency. Not shipped in
+#   # the runtime image (--omit=dev) and unreachable from any request path.
+#   # Upstream fix tracked in #42.
+#   CVE-2024-00000 exp:2026-12-31
+
+# (empty - the image gate is currently passing with no suppressions)

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "orders-api.fullname" . }}
+  labels:
+    {{- include "orders-api.labels" . | nindent 4 }}
+data:
+  NODE_ENV: production
+  SERVICE_NAME: {{ include "orders-api.name" . }}
+  {{- range $key, $value := .Values.config }}
+  # Quoted unconditionally: an unquoted "8000" or "true" is a YAML int/bool and
+  # the API server rejects a ConfigMap whose values are not strings.
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

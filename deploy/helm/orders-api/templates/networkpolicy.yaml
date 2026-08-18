@@ -1,0 +1,69 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "orders-api.fullname" . }}
+  labels:
+    {{- include "orders-api.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "orders-api.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # From the NGINX ingress controller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+
+    {{- if .Values.networkPolicy.allowExternalLoadBalancer }}
+    # Required by the LoadBalancer Service. Azure SLB traffic arrives with a
+    # source address outside every cluster CIDR, and kubelet probes originate
+    # from node IPs, so neither can be expressed with a pod/namespace selector.
+    # This makes the app port effectively open - the restriction that still
+    # matters is that NO other port on these pods is reachable, and that egress
+    # is locked down below.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+    {{- end }}
+
+  egress:
+    # DNS. Without this rule every outbound name lookup fails and the symptom
+    # looks like a total network outage.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Outbound HTTPS only. A compromised pod cannot reach the API server, the
+    # node metadata endpoint, other namespaces, or anything else in the VNet.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Link-local: blocks the Azure IMDS endpoint (169.254.169.254),
+              # which is the standard path from container escape to cloud
+              # credential theft.
+              - 169.254.0.0/16
+      ports:
+        {{- range .Values.networkPolicy.allowedEgressPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+{{- end }}

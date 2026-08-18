@@ -1,0 +1,53 @@
+# Dev overlay - sized for a 2 x Standard_B2s trial cluster (4 vCPU total).
+#
+# Still 3 replicas, still zero-downtime rolling updates: the point of the demo
+# is that the *rollout mechanics* are real, only the capacity is small.
+
+replicaCount: 3
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  # Low ceiling: the cluster only autoscales to 3 nodes, so a runaway HPA would
+  # just pile up Pending pods.
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+# Small enough that 3 replicas plus system pods fit comfortably on 2 nodes.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+config:
+  LOG_LEVEL: debug
+  SHUTDOWN_DRAIN_MS: "8000"
+  SHUTDOWN_TIMEOUT_MS: "20000"
+  # Non-zero so the startup probe visibly does its job during a demo - pods sit
+  # Running-but-not-Ready for ~5s before joining the Service.
+  STARTUP_DELAY_MS: "5000"
+
+service:
+  type: LoadBalancer
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    # No host: matches any hostname, so it works on the bare ingress IP with
+    # zero DNS setup.
+    - host: ""
+      paths:
+        - path: /
+          pathType: Prefix
+
+# 2-node cluster: hard anti-affinity would leave the third replica Pending.
+podAntiAffinity:
+  enabled: true
+  type: preferred
+
+topologySpread:
+  enabled: true
+  whenUnsatisfiable: ScheduleAnyway

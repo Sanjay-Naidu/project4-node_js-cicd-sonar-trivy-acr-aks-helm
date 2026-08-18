@@ -1,0 +1,279 @@
+# Default values for orders-api.
+# Every value here is the "safe production" setting; environment overlays in
+# values-dev.yaml / values-prod.yaml only change what genuinely differs.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Overridden by CD with the ACR login server from the Terraform output.
+  repository: acrordersapidev000000.azurecr.io/ordersapi/orders-api
+  # NEVER "latest": a mutable tag makes rollbacks meaningless and lets two
+  # pods in the same ReplicaSet run different code. CD sets this to the git SHA.
+  tag: ""
+  # IfNotPresent is correct precisely because tags are immutable - there is
+  # never a reason to re-pull the same SHA.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Scale and rollout
+# ---------------------------------------------------------------------------
+
+# Three replicas is the smallest count that tolerates losing one pod while
+# still having redundancy for the next failure.
+replicaCount: 3
+
+revisionHistoryLimit: 5
+
+# Fail the rollout rather than hang forever if pods never become ready.
+# `helm upgrade --atomic` uses this to decide when to roll back.
+progressDeadlineSeconds: 300
+
+# A pod must stay ready this long before counting toward "available". Without
+# it a pod that passes one readiness check and then crashes still lets the
+# rollout advance.
+minReadySeconds: 10
+
+rollingUpdate:
+  # Add one new pod before removing any old one.
+  maxSurge: 1
+  # Zero: capacity never drops below replicaCount during a deploy. This is what
+  # makes the update genuinely zero-downtime, and it is why maxSurge must be
+  # non-zero (both at 0 would deadlock).
+  maxUnavailable: 0
+
+# Must comfortably exceed the app's SHUTDOWN_DRAIN_MS plus connection close
+# time, or the kubelet SIGKILLs mid-drain and in-flight requests are cut.
+terminationGracePeriodSeconds: 45
+
+# ---------------------------------------------------------------------------
+# Probes
+#
+# Three probes answering three different questions. The most common production
+# bug in this area is pointing liveness at a dependency check: a slow database
+# then restarts every pod simultaneously and turns a degradation into an
+# outage. Liveness here only asks "is this process still a working HTTP
+# server?".
+# ---------------------------------------------------------------------------
+probes:
+  # Gates the other two until boot completes. Allows up to
+  # failureThreshold * periodSeconds = 60s of startup without forcing
+  # liveness to carry a long initialDelay (which would also delay recovery
+  # from a genuine hang for the whole life of the pod).
+  startup:
+    enabled: true
+    path: /healthz/startup
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30
+    successThreshold: 1
+
+  # Controls Service endpoint membership. Flips to 503 the instant SIGTERM
+  # lands so traffic drains before the process stops listening.
+  readiness:
+    enabled: true
+    path: /healthz/ready
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+
+  # Restarts the container. Deliberately slack: 3 x 10s of failure before a
+  # kill, so a GC pause or a brief CPU starvation never triggers a restart.
+  liveness:
+    enabled: true
+    path: /healthz/live
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+
+# ---------------------------------------------------------------------------
+# Resources
+#
+# requests == what the scheduler reserves; limits == the ceiling.
+# CPU limit is intentionally omitted: CFS throttling on a Node.js event loop
+# causes latency spikes far worse than the noisy-neighbour problem the limit
+# would prevent. Memory limit IS set, because memory is incompressible and an
+# unbounded leak would evict other pods.
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+# ---------------------------------------------------------------------------
+# Autoscaling
+# ---------------------------------------------------------------------------
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  behavior:
+    scaleDown:
+      # Scale down slowly to avoid thrashing on a spiky workload.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+# ---------------------------------------------------------------------------
+# Disruption budget
+#
+# maxUnavailable (not minAvailable) so the budget scales correctly with the
+# HPA. With minAvailable: 3 and the HPA at 3 replicas, a node drain would
+# block forever.
+# ---------------------------------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# ---------------------------------------------------------------------------
+# Service
+#
+# Type LoadBalancer provisions a dedicated Azure public IP for this Service.
+# Note: with the ingress in front, ClusterIP is the conventional choice and a
+# second public IP is redundant (~USD 3/month). LoadBalancer is kept as the
+# default here because it is an explicit requirement of this build and it
+# demonstrates the Azure SLB integration - set type: ClusterIP to save the IP.
+# ---------------------------------------------------------------------------
+service:
+  type: LoadBalancer
+  port: 80
+  targetPort: http
+  annotations:
+    # Health-probe the real readiness endpoint rather than a raw TCP connect,
+    # so the Azure LB stops sending traffic to a draining pod.
+    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: /healthz/ready
+  # "Cluster" (rather than "Local") so the LB can reach pods on any node.
+  # Local preserves the client source IP but blackholes traffic to nodes with
+  # no local pod, which needs careful pod spreading to be safe.
+  externalTrafficPolicy: Cluster
+  loadBalancerSourceRanges: []
+
+# ---------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    # Keep the correlation id flowing from edge to app.
+    nginx.ingress.kubernetes.io/enable-request-id: "true"
+  hosts:
+    # An empty host produces a host-less rule that matches ANY hostname, so the
+    # ingress works on the raw load balancer IP with no DNS to configure. Set a
+    # real hostname (or "<ip>.nip.io") once DNS exists.
+    - host: ""
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # tls:
+  #   - secretName: orders-api-tls
+  #     hosts:
+  #       - orders.example.com
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+
+# Spread pods across nodes. ScheduleAnyway (not DoNotSchedule) so a 2-node
+# cluster can still schedule 3 replicas instead of leaving one Pending.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+  whenUnsatisfiable: ScheduleAnyway
+
+# Soft anti-affinity: prefer separate nodes, but never block scheduling.
+podAntiAffinity:
+  enabled: true
+  type: preferred
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # The app calls no Kubernetes API, so it gets no token. This removes the
+  # single most useful artefact an attacker finds after a container escape.
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  # uid/gid 1000 = the `node` user baked into the base image.
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  # The image ships everything it needs; nothing is written at runtime except
+  # /tmp, which is mounted as an emptyDir below.
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+networkPolicy:
+  enabled: true
+  # Egress is the valuable half of this policy: a compromised pod can reach
+  # DNS and outbound HTTPS only, not the rest of the cluster or the VNet.
+  allowedEgressPorts:
+    - 443
+  # Permits inbound on the app port from any source, which is required for the
+  # LoadBalancer Service (Azure SLB traffic arrives with a non-cluster source
+  # address) and for kubelet probes originating from node IPs. Set false when
+  # running ingress-only for a genuinely restrictive policy.
+  allowExternalLoadBalancer: true
+  ingressControllerNamespace: ingress-nginx
+
+# ---------------------------------------------------------------------------
+# Application configuration -> rendered into a ConfigMap
+# ---------------------------------------------------------------------------
+config:
+  LOG_LEVEL: info
+  SHUTDOWN_DRAIN_MS: "8000"
+  SHUTDOWN_TIMEOUT_MS: "20000"
+  STARTUP_DELAY_MS: "0"
+  BODY_LIMIT: 100kb
+
+containerPort: 3000
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "3000"
+  prometheus.io/path: /metrics
+
+podLabels: {}
+
+extraEnv: []

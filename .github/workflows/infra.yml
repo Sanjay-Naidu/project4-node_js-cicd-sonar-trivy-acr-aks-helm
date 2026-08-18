@@ -1,0 +1,282 @@
+name: Infrastructure
+
+# Terraform for the AKS + ACR stack.
+#
+#   pull_request      -> fmt, validate, security scan, plan (posted as a comment)
+#   workflow_dispatch -> plan, then apply behind an environment approval gate
+#
+# Apply is never automatic. Infrastructure changes on a shared subscription are
+# exactly the class of change that deserves a human reading the plan first.
+#
+# plan and apply are separate JOBS rather than steps, for an OIDC reason worth
+# knowing: as soon as a job declares `environment:`, GitHub changes the OIDC
+# token's subject claim from the branch/PR form to
+# `repo:owner/repo:environment:<name>`. A single job that conditionally sets an
+# environment would therefore need a federated credential for both shapes.
+# Splitting them keeps each job's subject stable and predictable.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Operation to perform
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply]
+      environment:
+        description: tfvars profile to use
+        required: true
+        default: dev
+        type: choice
+        options: [dev, prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  # State locking already prevents corruption; serialising here turns a
+  # confusing lock error into an orderly queue.
+  group: terraform-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.10.3"
+  TF_DIR: infra/terraform
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+  # Read directly by Terraform - no need to wire them into the provider block.
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+  # Authenticate to the state blob with Entra ID rather than a storage account
+  # access key, matching use_azuread_auth in backend.tf.
+  ARM_USE_AZUREAD: "true"
+
+  # Kept out of the committed tfvars because this repo is public. Terraform
+  # picks up TF_VAR_-prefixed variables automatically.
+  TF_VAR_cicd_principal_object_id: ${{ vars.AZURE_CICD_PRINCIPAL_OBJECT_ID }}
+
+jobs:
+  # ==========================================================================
+  # Plan. No `environment:`, so the OIDC subject stays the branch/PR form.
+  # ==========================================================================
+  plan:
+    name: Plan (${{ inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write          # OIDC to Azure
+      pull-requests: write     # to post the plan comment
+
+    env:
+      TFVARS: environments/${{ inputs.environment || 'dev' }}.tfvars
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check backend configuration
+        run: |
+          missing=""
+          for var in TFSTATE_RESOURCE_GROUP TFSTATE_STORAGE_ACCOUNT TFSTATE_CONTAINER AZURE_CLIENT_ID; do
+            case "$var" in
+              TFSTATE_RESOURCE_GROUP)  value="${{ vars.TFSTATE_RESOURCE_GROUP }}" ;;
+              TFSTATE_STORAGE_ACCOUNT) value="${{ vars.TFSTATE_STORAGE_ACCOUNT }}" ;;
+              TFSTATE_CONTAINER)       value="${{ vars.TFSTATE_CONTAINER }}" ;;
+              AZURE_CLIENT_ID)         value="${{ vars.AZURE_CLIENT_ID }}" ;;
+            esac
+            if [ -z "$value" ]; then
+              missing="${missing} ${var}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::Missing repository variables:${missing}"
+            echo "See docs/AZURE-SETUP.md - these name the storage account holding Terraform state."
+            exit 1
+          fi
+          echo "Backend configuration present."
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform fmt
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          # Partial backend config: the state location is supplied here so it
+          # never has to be committed to a public repository.
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=orders-api/${{ inputs.environment || 'dev' }}.terraform.tfstate"
+
+      - name: terraform validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate -no-color
+
+      - name: Trivy IaC scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"     # advisory: findings are reviewed, not auto-blocking
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -no-color -lock-timeout=5m \
+            -var-file="${TFVARS}" \
+            -out=tfplan | tee plan.txt
+          # A GitHub comment caps at 65535 characters and a first-run AKS plan
+          # comfortably exceeds it.
+          head -c 60000 plan.txt > plan-truncated.txt
+
+      - name: Post the plan on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.TF_DIR }}/plan-truncated.txt', 'utf8');
+            const body = [
+              '### Terraform plan — `${{ inputs.environment || "dev" }}`',
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            // Update the existing comment rather than adding a new one on every
+            // push, which would bury the conversation.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('### Terraform plan'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment || 'dev' }}-${{ github.run_number }}
+          path: |
+            ${{ env.TF_DIR }}/tfplan
+            ${{ env.TF_DIR }}/plan.txt
+          retention-days: 14
+
+  # ==========================================================================
+  # Apply. Declares `environment: infra-apply`, so its OIDC subject is
+  # `repo:owner/repo:environment:infra-apply` - the federated credential the
+  # setup script creates under that exact name.
+  # ==========================================================================
+  apply:
+    name: Apply (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+    timeout-minutes: 45
+    # Add required reviewers here in repo settings for an approval gate.
+    environment: infra-apply
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=orders-api/${{ inputs.environment }}.terraform.tfstate"
+
+      - name: Download the reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_number }}
+          path: ${{ env.TF_DIR }}
+
+      - name: terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          # Applies the saved plan file rather than re-planning: what was
+          # reviewed is exactly what executes, with no window for drift.
+          terraform apply -no-color -lock-timeout=5m -auto-approve tfplan
+
+      - name: Publish the values CI/CD needs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          ACR_NAME=$(terraform output -raw acr_name)
+          ACR_SERVER=$(terraform output -raw acr_login_server)
+          AKS_NAME=$(terraform output -raw aks_cluster_name)
+          RG=$(terraform output -raw resource_group_name)
+
+          {
+            echo "### Infrastructure ready"
+            echo ""
+            echo "Set these under **Settings → Secrets and variables → Actions → Variables**:"
+            echo ""
+            echo "| Variable | Value |"
+            echo "|---|---|"
+            echo "| \`ACR_NAME\` | \`${ACR_NAME}\` |"
+            echo "| \`ACR_LOGIN_SERVER\` | \`${ACR_SERVER}\` |"
+            echo "| \`AKS_CLUSTER_NAME\` | \`${AKS_NAME}\` |"
+            echo "| \`AZURE_RESOURCE_GROUP\` | \`${RG}\` |"
+            echo ""
+            echo "Then run **Platform bootstrap** to install the ingress controller."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,282 @@
+name: CD
+
+# Deploys a specific, already-scanned image tag to AKS with Helm.
+#
+# Reusable (workflow_call) so CI can invoke it automatically after a merge, and
+# manually dispatchable so any previously built tag can be promoted or rolled
+# forward without rebuilding. The image is never rebuilt here - the artefact
+# that was tested is the artefact that ships.
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Immutable image tag (git short SHA) to deploy
+        required: true
+        type: string
+      environment:
+        description: Target environment
+        required: false
+        default: dev
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to deploy (git short SHA, e.g. a1b2c3d)
+        required: true
+        type: string
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options: [dev, prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One deploy per environment at a time. Never cancelled: interrupting a helm
+  # upgrade mid-flight leaves the release in a pending state that needs manual
+  # repair.
+  group: cd-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to AKS (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Attach approval gates / environment secrets here in repo settings.
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      RELEASE: orders-api
+      NAMESPACE: ${{ vars.AKS_NAMESPACE || 'orders-api' }}
+      CHART: deploy/helm/orders-api
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required configuration
+        env:
+          # Surfaced as env vars rather than inlined into the script, so a value
+          # containing shell metacharacters cannot alter the check.
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+          ACR_NAME: ${{ vars.ACR_NAME }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          missing=""
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID \
+                      AZURE_RESOURCE_GROUP AKS_CLUSTER_NAME ACR_NAME ACR_LOGIN_SERVER; do
+            if [ -z "${!name}" ]; then
+              missing="${missing} ${name}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::Missing repository variables:${missing}"
+            echo "Set them under Settings -> Secrets and variables -> Actions -> Variables."
+            echo "The values are printed by the Terraform apply job (see docs/AZURE-SETUP.md)."
+            exit 1
+          fi
+          echo "All required variables are present."
+
+      # Federated OIDC: GitHub mints a short-lived token, Entra ID exchanges it
+      # for an Azure access token. No client secret exists to leak or expire.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      # The cluster has local accounts disabled and Azure RBAC enabled, so the
+      # kubeconfig is Entra-backed and kubectl needs kubelogin to exchange the
+      # az CLI token for a cluster token.
+      - uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: v0.1.4
+
+      - name: Get cluster credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --overwrite-existing
+          # `azurecli` mode reuses the token azure/login already obtained.
+          kubelogin convert-kubeconfig -l azurecli
+          kubectl version
+          kubectl get nodes -o wide
+
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+          # Required by the chart's NetworkPolicy namespaceSelector. Kubernetes
+          # sets this automatically from 1.21, but applying it is idempotent and
+          # makes the dependency explicit.
+          kubectl label namespace "${NAMESPACE}" \
+            "kubernetes.io/metadata.name=${NAMESPACE}" --overwrite
+
+      - name: Verify the image exists in ACR before touching the cluster
+        run: |
+          # Cheaper to fail here than to have Helm roll out ImagePullBackOff
+          # pods and then time out.
+          if ! az acr repository show-tags \
+                --name "${{ vars.ACR_NAME }}" \
+                --repository "ordersapi/orders-api" \
+                --output tsv | grep -qx "${{ inputs.image_tag }}"; then
+            echo "::error::Tag '${{ inputs.image_tag }}' not found in ACR ${{ vars.ACR_NAME }}."
+            exit 1
+          fi
+          echo "Image tag ${{ inputs.image_tag }} confirmed present."
+
+      - name: Record the current revision for rollback
+        id: current
+        run: |
+          if helm -n "${NAMESPACE}" status "${RELEASE}" >/dev/null 2>&1; then
+            REV=$(helm -n "${NAMESPACE}" list -o json | jq -r ".[] | select(.name==\"${RELEASE}\") | .revision")
+            echo "revision=${REV}" >> "$GITHUB_OUTPUT"
+            echo "Existing release at revision ${REV}"
+          else
+            echo "revision=0" >> "$GITHUB_OUTPUT"
+            echo "First install"
+          fi
+
+      - name: Render the diff for the log
+        run: |
+          # A plain `helm template` of what is about to be applied. Makes the
+          # run log a genuine audit record of what changed.
+          helm template "${RELEASE}" "${CHART}" \
+            --namespace "${NAMESPACE}" \
+            --values "${CHART}/values-${{ inputs.environment }}.yaml" \
+            --set image.repository="${{ vars.ACR_LOGIN_SERVER }}/ordersapi/orders-api" \
+            --set image.tag="${{ inputs.image_tag }}"
+
+      - name: Helm upgrade
+        run: |
+          # --atomic  : roll back automatically if the rollout does not succeed
+          # --wait    : block until pods are Ready AND the PDB/HPA settle
+          # --timeout : must exceed progressDeadlineSeconds in the chart
+          helm upgrade --install "${RELEASE}" "${CHART}" \
+            --namespace "${NAMESPACE}" \
+            --create-namespace \
+            --values "${CHART}/values-${{ inputs.environment }}.yaml" \
+            --set image.repository="${{ vars.ACR_LOGIN_SERVER }}/ordersapi/orders-api" \
+            --set image.tag="${{ inputs.image_tag }}" \
+            --atomic \
+            --wait \
+            --timeout 10m \
+            --description "ci run ${{ github.run_number }} / commit ${{ github.sha }}"
+
+      - name: Confirm the rollout
+        run: |
+          kubectl -n "${NAMESPACE}" rollout status "deploy/${RELEASE}" --timeout=5m
+          kubectl -n "${NAMESPACE}" get deploy,pods,svc,ingress,hpa,pdb -o wide
+
+      - name: Assert every pod runs the expected build
+        run: |
+          # Guards against a partially-completed rollout that `rollout status`
+          # reported as done because old pods were still counted as available.
+          EXPECTED="${{ vars.ACR_LOGIN_SERVER }}/ordersapi/orders-api:${{ inputs.image_tag }}"
+          ACTUAL=$(kubectl -n "${NAMESPACE}" get pods \
+            -l "app.kubernetes.io/instance=${RELEASE}" \
+            -o jsonpath='{.items[*].spec.containers[0].image}' | tr ' ' '\n' | sort -u)
+          echo "Expected: ${EXPECTED}"
+          echo "Running:  ${ACTUAL}"
+          if [ "$(echo "${ACTUAL}" | wc -l)" -ne 1 ] || [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::Pods are not all running the deployed tag."
+            exit 1
+          fi
+
+      - name: Helm smoke test
+        run: |
+          helm test "${RELEASE}" --namespace "${NAMESPACE}" --timeout 5m --logs
+
+      - name: External endpoint check
+        id: endpoint
+        run: |
+          # The Helm test proves in-cluster routing. This proves the whole path
+          # from the public internet through the Azure LB.
+          echo "Waiting for the LoadBalancer public IP..."
+          for _ in $(seq 1 30); do
+            SVC_IP=$(kubectl -n "${NAMESPACE}" get svc "${RELEASE}" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            [ -n "${SVC_IP}" ] && break
+            sleep 10
+          done
+
+          if [ -z "${SVC_IP}" ]; then
+            echo "::warning::LoadBalancer IP not assigned within 5 minutes (Service may be ClusterIP)."
+            exit 0
+          fi
+
+          echo "svc_ip=${SVC_IP}" >> "$GITHUB_OUTPUT"
+          echo "Probing http://${SVC_IP}/healthz"
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 10 "http://${SVC_IP}/healthz"; then
+              echo ""
+              echo "External endpoint healthy."
+              exit 0
+            fi
+            echo "attempt ${i} failed, retrying..."
+            sleep 10
+          done
+          echo "::error::External endpoint never became healthy."
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### Deployment"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Environment | ${{ inputs.environment }} |"
+            echo "| Image tag | \`${{ inputs.image_tag }}\` |"
+            echo "| Namespace | \`${NAMESPACE}\` |"
+            echo "| Cluster | \`${{ vars.AKS_CLUSTER_NAME }}\` |"
+            echo "| Previous revision | ${{ steps.current.outputs.revision }} |"
+            echo "| Result | ${{ job.status }} |"
+            [ -n "${{ steps.endpoint.outputs.svc_ip }}" ] && echo "| LoadBalancer | http://${{ steps.endpoint.outputs.svc_ip }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --atomic already rolled the release back; this collects the evidence
+      # needed to understand *why*, which is otherwise lost when the failed
+      # pods are deleted.
+      - name: Capture diagnostics on failure
+        if: failure()
+        run: |
+          echo "::group::Helm history"
+          helm -n "${NAMESPACE}" history "${RELEASE}" || true
+          echo "::endgroup::"
+
+          echo "::group::Pods"
+          kubectl -n "${NAMESPACE}" get pods -o wide || true
+          kubectl -n "${NAMESPACE}" describe pods -l "app.kubernetes.io/instance=${RELEASE}" || true
+          echo "::endgroup::"
+
+          echo "::group::Recent events"
+          kubectl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp | tail -50 || true
+          echo "::endgroup::"
+
+          echo "::group::Container logs"
+          kubectl -n "${NAMESPACE}" logs -l "app.kubernetes.io/instance=${RELEASE}" \
+            --tail=200 --all-containers --prefix || true
+          echo "::endgroup::"

@@ -1,0 +1,64 @@
+{{/*
+`helm test` smoke check. Runs in-cluster against the Service, so it exercises
+the real Service -> endpoints -> pod path rather than hitting a pod IP directly.
+The CD workflow runs this after every upgrade.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "orders-api.fullname" . }}-test"
+  labels:
+    {{- include "orders-api.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    # Kept on failure so the logs are inspectable; the CD workflow deletes it
+    # explicitly once it has read them.
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: smoke
+      image: curlimages/curl:8.11.1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 64Mi
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          BASE="http://{{ include "orders-api.fullname" . }}:{{ .Values.service.port }}"
+
+          echo "--> readiness"
+          curl -fsS --max-time 10 "${BASE}/healthz/ready"
+
+          echo "\n--> version endpoint reports the deployed build"
+          curl -fsS --max-time 10 "${BASE}/healthz" | grep -q '{{ .Values.image.tag | default .Chart.AppVersion }}' \
+            || { echo "deployed version does not match the expected tag"; exit 1; }
+
+          echo "\n--> create an order"
+          CREATED=$(curl -fsS --max-time 10 -X POST "${BASE}/api/v1/orders" \
+            -H 'Content-Type: application/json' \
+            -d '{"customer":"helm-test","items":[{"sku":"SMOKE-1","quantity":1,"unitPrice":100}]}')
+          echo "${CREATED}"
+
+          echo "\n--> list orders"
+          curl -fsS --max-time 10 "${BASE}/api/v1/orders" >/dev/null
+
+          echo "\n--> metrics are exposed"
+          curl -fsS --max-time 10 "${BASE}/metrics" | grep -q http_requests_total
+
+          echo "\nsmoke test passed"

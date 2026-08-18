@@ -1,0 +1,167 @@
+name: Platform bootstrap
+
+# Installs the cluster-level components the application chart depends on.
+# Run once after `Infrastructure -> apply`, and again only when a component
+# needs upgrading. It is idempotent, so re-running is always safe.
+#
+# The ingress controller is deliberately NOT part of the app chart: its
+# lifecycle is the cluster's, not the application's, and bundling them would
+# mean every app deploy could disturb the shared front door.
+
+on:
+  workflow_dispatch:
+    inputs:
+      install_ingress:
+        description: Install/upgrade ingress-nginx
+        required: true
+        default: true
+        type: boolean
+      install_cert_manager:
+        description: Install/upgrade cert-manager (needs a real DNS name to be useful)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-bootstrap
+  cancel-in-progress: false
+
+env:
+  INGRESS_NAMESPACE: ingress-nginx
+  # Pinned: an unpinned ingress controller upgrading itself under a live
+  # workload is a genuinely bad afternoon.
+  INGRESS_CHART_VERSION: "4.12.0"
+  CERT_MANAGER_VERSION: "v1.16.2"
+
+jobs:
+  bootstrap:
+    name: Install platform components
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: v0.1.4
+
+      - name: Get cluster credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+          kubectl get nodes
+
+      - name: Install ingress-nginx
+        if: inputs.install_ingress
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace "${INGRESS_NAMESPACE}" \
+            --create-namespace \
+            --version "${INGRESS_CHART_VERSION}" \
+            --set controller.replicaCount=2 \
+            --set controller.service.type=LoadBalancer \
+            --set controller.service.externalTrafficPolicy=Cluster \
+            --set controller.metrics.enabled=true \
+            --set controller.podAnnotations."prometheus\.io/scrape"=true \
+            --set controller.podAnnotations."prometheus\.io/port"=10254 \
+            --set controller.resources.requests.cpu=100m \
+            --set controller.resources.requests.memory=128Mi \
+            --set controller.admissionWebhooks.enabled=true \
+            --set-string controller.config.use-forwarded-headers=true \
+            --set-string controller.config.compute-full-forwarded-for=true \
+            --set-string controller.config.proxy-body-size=1m \
+            --set controller.topologySpreadConstraints[0].maxSkew=1 \
+            --set controller.topologySpreadConstraints[0].topologyKey=kubernetes.io/hostname \
+            --set controller.topologySpreadConstraints[0].whenUnsatisfiable=ScheduleAnyway \
+            --set 'controller.topologySpreadConstraints[0].labelSelector.matchLabels.app\.kubernetes\.io/name=ingress-nginx' \
+            --wait \
+            --timeout 10m
+
+          # The NetworkPolicy in the app chart selects this namespace by label.
+          kubectl label namespace "${INGRESS_NAMESPACE}" \
+            "kubernetes.io/metadata.name=${INGRESS_NAMESPACE}" --overwrite
+
+      - name: Wait for the ingress public IP
+        if: inputs.install_ingress
+        id: ingress
+        run: |
+          echo "Azure typically takes 1-3 minutes to provision the public IP."
+          for _ in $(seq 1 36); do
+            IP=$(kubectl -n "${INGRESS_NAMESPACE}" get svc ingress-nginx-controller \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            if [ -n "${IP}" ]; then
+              echo "ingress_ip=${IP}" >> "$GITHUB_OUTPUT"
+              echo "Ingress IP: ${IP}"
+              break
+            fi
+            sleep 10
+          done
+          [ -n "${IP:-}" ] || { echo "::error::No ingress IP after 6 minutes."; exit 1; }
+
+      - name: Install cert-manager
+        if: inputs.install_cert_manager
+        run: |
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager \
+            --create-namespace \
+            --version "${CERT_MANAGER_VERSION}" \
+            --set crds.enabled=true \
+            --set resources.requests.cpu=10m \
+            --set resources.requests.memory=32Mi \
+            --wait --timeout 10m
+
+          echo "::notice::cert-manager installed. A ClusterIssuer still needs a real DNS name pointing at the ingress IP - see docs/RUNBOOK.md."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Platform components"
+            echo ""
+            echo "| Component | Status |"
+            echo "|---|---|"
+            echo "| ingress-nginx ${INGRESS_CHART_VERSION} | ${{ inputs.install_ingress && 'installed' || 'skipped' }} |"
+            echo "| cert-manager ${CERT_MANAGER_VERSION} | ${{ inputs.install_cert_manager && 'installed' || 'skipped' }} |"
+            if [ -n "${{ steps.ingress.outputs.ingress_ip }}" ]; then
+              echo ""
+              echo "**Ingress address:** http://${{ steps.ingress.outputs.ingress_ip }}"
+              echo ""
+              echo "Once the app is deployed, the API is reachable at that IP."
+              echo "For a hostname without configuring DNS, use nip.io:"
+              echo '```'
+              echo "http://orders.${{ steps.ingress.outputs.ingress_ip }}.nip.io/healthz"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

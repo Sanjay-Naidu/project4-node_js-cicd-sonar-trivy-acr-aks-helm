@@ -1,0 +1,27 @@
+apiVersion: v2
+name: orders-api
+description: Node.js REST API on AKS - rolling updates, three-probe health model, LoadBalancer Service and NGINX ingress
+type: application
+
+# Chart version: bumped when the templates change.
+version: 1.0.0
+
+# Default application version. The CD pipeline overrides this with the immutable
+# image tag (the git SHA) via --set image.tag, so a release is always traceable
+# back to a single commit.
+appVersion: "1.0.0"
+
+keywords:
+  - nodejs
+  - aks
+  - devsecops
+
+maintainers:
+  - name: Sanjay Naidu
+    url: https://github.com/Sanjay-Naidu
+
+sources:
+  - https://github.com/Sanjay-Naidu/project4-node_js-cicd-sonar-trivy-acr-aks-helm
+
+annotations:
+  category: Application

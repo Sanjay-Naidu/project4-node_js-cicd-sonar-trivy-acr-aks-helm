@@ -1,0 +1,34 @@
+# Keep the build context minimal: smaller context = faster builds, and nothing
+# secret or environment-specific can be accidentally baked into a layer.
+
+node_modules
+coverage
+target
+.nyc_output
+
+# Tests, lint and build tooling run in CI, never inside the runtime image.
+tests
+jest.config.js
+eslint.config.js
+pom.xml
+
+Dockerfile
+.dockerignore
+
+.git
+.gitignore
+.github
+
+*.md
+*.log
+npm-debug.log*
+
+.env
+.env.*
+*.pem
+*.key
+
+.vscode
+.idea
+.DS_Store
+Thumbs.db
