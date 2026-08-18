@@ -33,8 +33,8 @@ env:
   INGRESS_NAMESPACE: ingress-nginx
   # Pinned: an unpinned ingress controller upgrading itself under a live
   # workload is a genuinely bad afternoon.
-  INGRESS_CHART_VERSION: "4.12.0"
-  CERT_MANAGER_VERSION: "v1.16.2"
+  INGRESS_CHART_VERSION: "4.15.1"
+  CERT_MANAGER_VERSION: "v1.21.1"
 
 jobs:
   bootstrap:
@@ -47,26 +47,26 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Azure login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
-          version: v3.16.3
+          version: v3.21.4
 
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@v5
         with:
-          version: v1.30.0
+          version: v1.35.7
 
       - uses: azure/use-kubelogin@v1
         with:
-          kubelogin-version: v0.1.4
+          kubelogin-version: v0.2.19
 
       - name: Get cluster credentials
         run: |

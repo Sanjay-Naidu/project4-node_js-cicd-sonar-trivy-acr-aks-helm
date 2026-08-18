@@ -31,7 +31,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TF_VERSION: "1.10.3"
+  TF_VERSION: "1.15.8"
   TF_DIR: infra/terraform
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
@@ -67,27 +67,27 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
       - name: Azure login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@v5
         with:
-          version: v1.30.0
+          version: v1.35.7
 
       - uses: azure/use-kubelogin@v1
         with:
-          kubelogin-version: v0.1.4
+          kubelogin-version: v0.2.19
 
       - name: terraform init
         working-directory: ${{ env.TF_DIR }}

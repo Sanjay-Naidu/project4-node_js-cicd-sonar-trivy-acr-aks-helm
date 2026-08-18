@@ -60,7 +60,7 @@ jobs:
       CHART: deploy/helm/orders-api
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check required configuration
         env:
@@ -92,26 +92,26 @@ jobs:
       # Federated OIDC: GitHub mints a short-lived token, Entra ID exchanges it
       # for an Azure access token. No client secret exists to leak or expire.
       - name: Azure login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
-          version: v3.16.3
+          version: v3.21.4
 
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@v5
         with:
-          version: v1.30.0
+          version: v1.35.7
 
       # The cluster has local accounts disabled and Azure RBAC enabled, so the
       # kubeconfig is Entra-backed and kubectl needs kubelogin to exchange the
       # az CLI token for a cluster token.
       - uses: azure/use-kubelogin@v1
         with:
-          kubelogin-version: v0.1.4
+          kubelogin-version: v0.2.19
 
       - name: Get cluster credentials
         run: |
