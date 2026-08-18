@@ -110,18 +110,49 @@ JSON
   ok "${name} -> ${subject}"
 }
 
-create_federated_credential "github-main-branch" \
-  "repo:${GITHUB_REPO}:ref:refs/heads/main" "Pushes to main (CI build and push)"
-create_federated_credential "github-pull-request" \
-  "repo:${GITHUB_REPO}:pull_request" "Pull requests (terraform plan)"
-create_federated_credential "github-env-dev" \
-  "repo:${GITHUB_REPO}:environment:dev" "CD to dev"
-create_federated_credential "github-env-prod" \
-  "repo:${GITHUB_REPO}:environment:prod" "CD to prod"
-create_federated_credential "github-env-infra-apply" \
-  "repo:${GITHUB_REPO}:environment:infra-apply" "terraform apply"
-create_federated_credential "github-env-infra-destroy" \
-  "repo:${GITHUB_REPO}:environment:infra-destroy" "terraform destroy"
+# GitHub issues OIDC subjects in one of two shapes:
+#
+#   classic     repo:OWNER/REPO:environment:dev
+#   immutable   repo:OWNER@<ownerId>/REPO@<repoId>:environment:dev
+#
+# The immutable form is a hardening feature (a renamed repository cannot
+# inherit the old one's trust) and is enabled per repository/organisation.
+# There is no way to know in advance which you will get - you find out when a
+# run fails with AADSTS700213 - so credentials are created for BOTH.
+SUBJECT_PREFIXES=("repo:${GITHUB_REPO}")
+
+if REPO_META=$(curl -fsS -H 'Accept: application/vnd.github+json' \
+                 "https://api.github.com/repos/${GITHUB_REPO}" 2>/dev/null); then
+  OWNER_LOGIN=$(printf '%s' "$REPO_META" | grep -o '"login"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  OWNER_ID=$(printf '%s' "$REPO_META" | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | sed -n '2p' | grep -o '[0-9]*')
+  REPO_ID=$(printf '%s' "$REPO_META" | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | grep -o '[0-9]*')
+  REPO_NAME="${GITHUB_REPO#*/}"
+  if [[ -n "$OWNER_LOGIN" && -n "$OWNER_ID" && -n "$REPO_ID" ]]; then
+    SUBJECT_PREFIXES+=("repo:${OWNER_LOGIN}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}")
+    ok "Immutable-id subject prefix: ${SUBJECT_PREFIXES[1]}"
+  fi
+else
+  echo "    [warn] could not read repository ids from api.github.com;" >&2
+  echo "           only classic subjects will be created." >&2
+fi
+
+# slug|suffix|description
+CREDENTIAL_SPECS=(
+  "main-branch|ref:refs/heads/main|Pushes to main (CI build and push)"
+  "pull-request|pull_request|Pull requests (terraform plan)"
+  "env-dev|environment:dev|CD to dev"
+  "env-prod|environment:prod|CD to prod"
+  "env-infra-apply|environment:infra-apply|terraform apply"
+  "env-infra-destroy|environment:infra-destroy|terraform destroy"
+)
+
+for prefix in "${SUBJECT_PREFIXES[@]}"; do
+  if [[ "$prefix" == *"@"* ]]; then shape="ghid"; else shape="gh"; fi
+  for spec in "${CREDENTIAL_SPECS[@]}"; do
+    IFS='|' read -r slug suffix description <<< "$spec"
+    create_federated_credential "${shape}-${slug}" "${prefix}:${suffix}" "$description"
+  done
+done
 
 # ---------------------------------------------------------------------------
 step "Assigning roles"

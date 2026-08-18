@@ -147,31 +147,61 @@ Write-Ok "State storage account: $StateStorageAccount"
 # ---------------------------------------------------------------------------
 Write-Step "Creating federated credentials"
 
-$credentials = @(
-    @{ name = "github-main-branch"
-       subject = "repo:${GitHubRepo}:ref:refs/heads/main"
-       description = "Pushes to main (CI: build and push image)" },
-
-    @{ name = "github-pull-request"
-       subject = "repo:${GitHubRepo}:pull_request"
-       description = "Pull requests (terraform plan; no write access used)" },
-
-    @{ name = "github-env-dev"
-       subject = "repo:${GitHubRepo}:environment:dev"
-       description = "CD job targeting the dev environment" },
-
-    @{ name = "github-env-prod"
-       subject = "repo:${GitHubRepo}:environment:prod"
-       description = "CD job targeting the prod environment" },
-
-    @{ name = "github-env-infra-apply"
-       subject = "repo:${GitHubRepo}:environment:infra-apply"
-       description = "terraform apply (approval-gated environment)" },
-
-    @{ name = "github-env-infra-destroy"
-       subject = "repo:${GitHubRepo}:environment:infra-destroy"
-       description = "terraform destroy (approval-gated environment)" }
+# The trigger shapes that need a credential. Each becomes a subject suffix.
+$credentialSuffixes = @(
+    @{ slug = "main-branch";       suffix = "ref:refs/heads/main";      description = "Pushes to main (CI: build and push image)" },
+    @{ slug = "pull-request";      suffix = "pull_request";             description = "Pull requests (terraform plan; no write access used)" },
+    @{ slug = "env-dev";           suffix = "environment:dev";          description = "CD job targeting the dev environment" },
+    @{ slug = "env-prod";          suffix = "environment:prod";         description = "CD job targeting the prod environment" },
+    @{ slug = "env-infra-apply";   suffix = "environment:infra-apply";  description = "terraform apply (approval-gated environment)" },
+    @{ slug = "env-infra-destroy"; suffix = "environment:infra-destroy"; description = "terraform destroy (approval-gated environment)" }
 )
+
+<#
+GitHub issues OIDC subjects in one of two shapes:
+
+  classic     repo:OWNER/REPO:environment:dev
+  immutable   repo:OWNER@<ownerId>/REPO@<repoId>:environment:dev
+
+The immutable form is a hardening feature - a renamed or recreated repository
+cannot inherit the previous repository's trust - and it is enabled per
+repository/organisation. There is no reliable way to know in advance which one
+your workflows will present; you find out when a run fails with:
+
+  AADSTS700213: No matching federated identity record found for presented
+  assertion subject 'repo:owner@123/repo@456:environment:dev'
+
+so credentials are created for BOTH shapes. They are cheap, and having the
+unused one costs nothing.
+#>
+$subjectPrefixes = @("repo:${GitHubRepo}")
+
+try {
+    $meta = Invoke-RestMethod -Uri "https://api.github.com/repos/${GitHubRepo}" `
+        -Headers @{ 'User-Agent' = 'azure-oidc-setup'; 'Accept' = 'application/vnd.github+json' } `
+        -TimeoutSec 30
+    $immutable = "repo:$($meta.owner.login)@$($meta.owner.id)/$($meta.name)@$($meta.id)"
+    $subjectPrefixes += $immutable
+    Write-Ok "Immutable-id subject prefix: $immutable"
+}
+catch {
+    Write-Host "    [warn] Could not read repository ids from api.github.com." -ForegroundColor Yellow
+    Write-Host "           Only classic subjects will be created. If a workflow later fails with" -ForegroundColor Yellow
+    Write-Host "           AADSTS700213, re-run this script once the API is reachable." -ForegroundColor Yellow
+}
+
+$credentials = @()
+foreach ($prefix in $subjectPrefixes) {
+    # "gh-" for the classic shape, "ghid-" for the immutable-id shape.
+    $shape = if ($prefix -match '@\d+') { "ghid" } else { "gh" }
+    foreach ($c in $credentialSuffixes) {
+        $credentials += @{
+            name        = "$shape-$($c.slug)"
+            subject     = "${prefix}:$($c.suffix)"
+            description = $c.description
+        }
+    }
+}
 
 $existing = az ad app federated-credential list --id $AppClientId --output json | ConvertFrom-Json
 $existingSubjects = @($existing | ForEach-Object { $_.subject })
