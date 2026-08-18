@@ -154,6 +154,39 @@ kubectl -n $NS get networkpolicy orders-api -o yaml
 kubectl -n $NS delete networkpolicy orders-api   # temporarily, to confirm
 ```
 
+### Everything is healthy in-cluster but times out from the internet
+
+The signature: `helm test` passes, endpoints are populated, the load balancer
+reports healthy backends, `kubectl port-forward` works — and every external
+request just hangs until it times out. No error anywhere.
+
+This is almost always **two NSGs**. AKS creates its own NSG in the node
+resource group and attaches it to the node NICs; when you create a
+LoadBalancer Service, the cloud controller programs `Allow Internet -> port`
+rules onto *that* NSG. It has no knowledge of a custom NSG attached to the
+subnet, and traffic has to pass both.
+
+So a subnet NSG ending in `DenyAllInBound` blackholes every LoadBalancer and
+ingress Service while leaving the cluster itself perfectly healthy.
+
+```bash
+# What AKS programmed for itself (you will see k8s-azure-lb_allow_* rules)
+az network nsg list -g "${AZURE_RESOURCE_GROUP}-nodes" --query "[].name" -o tsv
+az network nsg rule list -g "${AZURE_RESOURCE_GROUP}-nodes" \
+  --nsg-name <aks-agentpool-nsg> -o table
+
+# Your own subnet NSG - this is the one that needs the exception
+az network nsg rule list -g "$AZURE_RESOURCE_GROUP" \
+  --nsg-name nsg-ordersapi-dev-nodes \
+  --query "sort_by([],&priority)[].{pri:priority,name:name,access:access,src:sourceAddressPrefix}" -o table
+```
+
+`network.tf` carries an `AllowInternetToLoadBalancedServices` rule covering
+80, 443 and the nodePort range (30000-32767) for exactly this reason. If you
+add a LoadBalancer Service on some other port, it needs adding there too — or
+drop the custom subnet NSG and let AKS manage it, which is what most AKS
+deployments do.
+
 ### High latency
 
 ```bash

@@ -97,6 +97,14 @@ Then the honest part: readiness would check the connection pool, liveness still 
 **"Why is `latest` never used?"**
 A mutable tag means two pods in one ReplicaSet can run different code, and rollback becomes meaningless. The chart enforces it at template time — `_helpers.tpl` calls `fail` if the tag is empty or `latest`.
 
+**"Tell me about something that broke."**
+
+Two good ones, both from actually shipping this:
+
+*The Trivy gate did its job.* The image build failed on 24 HIGH + 2 CRITICAL findings. Alpine's OS packages were clean — every finding was inside **npm's own bundled dependencies** (`sigstore`, `glob`, `minimatch`, `cross-spawn`), which ship in `node:*-alpine` and which the running container never uses. The entrypoint is `node`. Deleting npm from the runtime stage took the image to zero findings and removed the most useful tool an attacker finds post-escape. There's now a guard that fails the build if a future base image reintroduces it.
+
+*Two NSGs, one silent blackhole.* After a clean deploy — rollout confirmed, `helm test` green, endpoints populated — every request from the internet timed out. The cause: AKS programs `Allow Internet` rules onto **its own** NSG in the node resource group when a LoadBalancer Service appears, and knows nothing about the custom NSG I'd attached to the subnet. Traffic must pass both, so my tidy-looking `DenyAllInBound` was dropping all of it while the cluster reported perfect health. The lesson is that "healthy in-cluster" and "reachable" are different assertions — which is exactly why the pipeline checks the external endpoint separately from `helm test`, and why that check is what caught it.
+
 **"How do you know the NetworkPolicy actually does anything?"**
 Because `network_policy = "azure"` is set on the cluster. Without a policy engine, NetworkPolicy objects are silently ignored — the manifest implies protection that doesn't exist, which is worse than having none.
 
