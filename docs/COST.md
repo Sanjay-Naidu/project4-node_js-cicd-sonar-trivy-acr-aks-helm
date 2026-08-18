@@ -43,7 +43,7 @@ Of the families this subscription does permit (D/E/F v7 and the confidential-com
 
 ### Realistic usage is much lower
 
-The table assumes the cluster runs 24×7 for a month. For a portfolio project you typically want it live for a few days of demos:
+The table assumes the cluster runs 24×7 for a month. In practice you usually want it live for a few days at a time:
 
 | Pattern | Cost |
 |---|---|
@@ -146,8 +146,8 @@ Orphaned public IPs and disks are the usual survivors, because they are created 
 
 ## After the trial expires
 
-The cluster stops, the resources remain, and nothing is deleted immediately. To keep the repository useful as a portfolio piece without any Azure spend:
+The cluster stops, the resources remain, and nothing is deleted immediately. To keep the repository useful without any Azure spend:
 
 - The full pipeline **through image build, scan and push** works on any subscription — including a $0 one, if you point it at a free registry.
 - Every CI gate (Maven, Sonar, Trivy, CodeQL, Helm lint, kubeconform, Terraform validate) runs on GitHub-hosted runners with **no cloud account at all**.
-- Screenshot the working deployment, the Actions run graph, the Security tab and the SonarCloud dashboard before tearing down. Those are what an interviewer actually looks at.
+- Capture the working deployment, the Actions run graph, the Security tab and the SonarCloud dashboard before tearing down — those are the evidence that it ran, and they cost nothing to keep.

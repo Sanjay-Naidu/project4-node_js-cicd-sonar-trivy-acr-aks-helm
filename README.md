@@ -83,7 +83,7 @@ flowchart LR
 
 ---
 
-## Why each decision (the part interviewers ask about)
+## Why each decision
 
 ### Application
 
@@ -172,7 +172,7 @@ flowchart LR
 Cost levers built in:
 
 - `az aks stop --name aks-ordersapi-dev --resource-group rg-ordersapi-dev` — pause when not demoing (compute drops to ~$0, restart takes ~3 min).
-- The Terraform workflow has a gated **destroy** action — tear everything down between interview cycles, re-create in ~15 minutes.
+- The Terraform workflow has a gated **destroy** action — tear everything down when you're not using it, re-create in ~15 minutes.
 - Log Analytics daily cap bounds the one line item that can run away unattended.
 
 ---
@@ -188,7 +188,7 @@ Cost levers built in:
 │   └── environments/           # dev.tfvars / prod.tfvars
 ├── .github/workflows/          # ci, cd, infra, infra-destroy, platform, codeql
 ├── scripts/                    # OIDC setup, zero-downtime verification
-└── docs/                       # AZURE-SETUP, ARCHITECTURE, RUNBOOK, COST, INTERVIEW-NOTES
+└── docs/                       # AZURE-SETUP, ARCHITECTURE, RUNBOOK, COST, DESIGN-NOTES
 ```
 
 ---
