@@ -437,10 +437,13 @@ jobs:
           path: sbom.cdx.json
           retention-days: 30
 
-      # ---- Everything below only runs on main ----
+      # ---- Everything below only runs on main, and only once a registry
+      #      exists. Gating on ACR_LOGIN_SERVER means the full build-and-scan
+      #      path is exercised before any infrastructure has been provisioned,
+      #      rather than failing the run on a registry that is not there yet. ----
 
       - name: Azure login (OIDC - no stored credentials)
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != ''
         uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
@@ -448,7 +451,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Push to ACR
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != ''
         run: |
           # Exchanges the Entra ID token for a registry refresh token. No
           # registry username or password exists anywhere.
@@ -466,11 +469,11 @@ jobs:
       # via the same OIDC token, and recorded in the public Rekor transparency
       # log. Nothing to store, nothing to rotate.
       - name: Install cosign
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ENABLE_IMAGE_SIGNING != 'false'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != '' && vars.ENABLE_IMAGE_SIGNING != 'false'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign the image
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ENABLE_IMAGE_SIGNING != 'false'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != '' && vars.ENABLE_IMAGE_SIGNING != 'false'
         run: |
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' \
             "${{ steps.img.outputs.ref }}:${{ env.IMAGE_TAG }}")
@@ -499,7 +502,9 @@ jobs:
   deploy:
     name: Deploy
     needs: [build, image, sonar, scan]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # Skipped until the cluster and registry exist, so CI is green and useful
+    # from the very first push rather than red until infrastructure is applied.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ACR_LOGIN_SERVER != '' && vars.AKS_CLUSTER_NAME != ''
     uses: ./.github/workflows/cd.yml
     with:
       image_tag: ${{ needs.build.outputs.image_tag }}
